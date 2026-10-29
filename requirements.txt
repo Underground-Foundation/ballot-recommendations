@@ -1,0 +1,7 @@
+gspread
+python-dotenv
+pdfplumber
+beautifulsoup4
+reportlab
+pypdf
+svglib

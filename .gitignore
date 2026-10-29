@@ -1,0 +1,9 @@
+.env
+*.json
+*.csv
+!package.json
+.venv/
+__pycache__/
+.idea/
+party_logos/*
+ballots/*
