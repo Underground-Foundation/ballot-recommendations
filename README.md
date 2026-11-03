@@ -38,8 +38,11 @@ python download_candidate_scores.py [--url '<spreadsheet url>'] [--output candid
 ### Rendering 
 Before rendering, we must first discover the font etc to be used, by relying on an example PDF:
 ```
-python pdf_inspection.py Footscray.pdf --candidate-text 'HALL, Katie' > rendering.json
+python pdf_inspection.py Footscray.pdf --candidate-text 'HALL, Katie' --candidate-count 'Number the squares' > rendering.json
 ```
+`--candidate-count` is optional. Give it any text unique to the line stating the number of candidates; when rendering,
+the highest number in that line of the base PDF (the 8 in "from 1 to 8") becomes the electorate's number of candidates.
+Without it, the JSON has no `candidate_count` and the base PDF's numbers are left as they are.
 
 With these details, we can then render voting-guide PDFs for each of our electorates from <candidates_with_scores.csv>:
 

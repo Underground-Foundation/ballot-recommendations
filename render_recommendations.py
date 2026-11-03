@@ -16,13 +16,16 @@ from io import BytesIO
 from pathlib import Path
 
 import pdfplumber
-from pypdf import PdfReader, PdfWriter
+from pypdf import PageObject, PdfReader, PdfWriter
+from pypdf.generic import ArrayObject, ContentStream, FloatObject, TextStringObject
 from reportlab.lib.colors import HexColor, white
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.graphics import renderPDF
 from reportlab.pdfgen.canvas import Canvas
 from svglib.svglib import svg2rlg
+
+from pdf_inspection import find_candidate_count
 
 DEFAULT_INPUT = "candidates_with_scores.csv"
 DEFAULT_RENDERING = "candidate_rendering.json"
@@ -123,19 +126,58 @@ def draw_logo(canvas: Canvas, logo: Path, x: float, y: float, width: float, heig
                    y + (height - drawing.height * scale) / 2)
 
 
-def draw_district(canvas: Canvas, electorate: str, district_text: dict) -> None:
-    """Draw eg "ALBERT PARK DISTRICT" with the font, colour and position of the reference ballot's district text."""
-    font = register_font(district_text["font_faces"][0])
-    size = district_text["sizes_pt"][0]
+def draw_with_style_reference(canvas: Canvas, text: str, reference: dict) -> None:
+    """Draw the text with the font, colour and position of the given text on the reference ballot."""
+    font = register_font(reference["font_faces"][0])
+    size = reference["sizes_pt"][0]
     canvas.setFont(font, size)
-    canvas.setFillColor(get_text_colour(district_text))
+    canvas.setFillColor(get_text_colour(reference))
     # The baseline is already measured up from the bottom of the page, as ReportLab expects.
-    canvas.drawString(district_text["x_pt"], district_text["baseline_pt"], f"{electorate.upper()} DISTRICT")
+    canvas.drawString(reference["x_pt"], reference["baseline_pt"], text)
+
+
+def make_room_for_number(page: PageObject, box_text: str, number: str, gap: float) -> None:
+    """Remove the number from the page's text showing box_text, leaving a gap for its replacement. The gap is in
+    thousandths of the text's font size, and moves the text after the number along to suit the replacement's width."""
+    squeeze = lambda text: "".join(text.split())  # spaces may be drawn as gaps rather than as characters
+    content = ContentStream(page.get_contents(), page.pdf)
+    for operands, operator in content.operations:
+        if operator != b"TJ":
+            continue
+        text = "".join(item for item in operands[0] if isinstance(item, str))
+        found = re.search(rf"(?<!\d){number}(?!\d)", text)
+        if not found or squeeze(box_text) not in squeeze(text):
+            continue
+
+        spliced = ArrayObject()
+        position = 0
+        gap_added = False
+        for item in operands[0]:
+            if not isinstance(item, str):
+                spliced.append(item)
+                continue
+            start, position = position, position + len(item)
+            if position <= found.start() or start >= found.end():
+                spliced.append(item)
+                continue
+            if found.start() > start:
+                spliced.append(TextStringObject(item[:found.start() - start]))
+            if not gap_added:
+                spliced.append(FloatObject(-gap))
+                gap_added = True
+            if found.end() < position:
+                spliced.append(TextStringObject(item[found.end() - start:]))
+        operands[0] = spliced
+        page.replace_contents(content)
+        return
+    sys.exit(f'Could not edit the number {number} next to "{box_text}" in the base PDF; '
+             "its text is drawn in a way this program doesn't handle")
 
 
 def render_overlay(electorate: str, candidates: list[dict[str, str]], rendering: dict,
-                   page_size: tuple[float, float], logo_dir: Path) -> BytesIO:
-    """Draw the district name and candidate rows on a transparent page, to be laid over the base ballot."""
+                   page_size: tuple[float, float], logo_dir: Path, candidate_count: dict | None) -> BytesIO:
+    """Draw the district name, candidate rows and any candidate count on a transparent page, to be laid over
+    the base ballot PDF."""
     candidate_text, box, party_text = rendering["candidate_text"], rendering["left_box"], rendering["party_text"]
     page_height = page_size[1]
     candidate_font = register_font(candidate_text["font_faces"][0])
@@ -158,7 +200,9 @@ def render_overlay(electorate: str, candidates: list[dict[str, str]], rendering:
     ascent, descent = pdfmetrics.getAscentDescent(candidate_font, candidate_size)
     buffer = BytesIO()
     canvas = Canvas(buffer, pagesize=page_size)
-    draw_district(canvas, electorate, rendering["district_text"])
+    draw_with_style_reference(canvas, f"{electorate.upper()} DISTRICT", rendering["district_text"])
+    if candidate_count:
+        draw_with_style_reference(canvas, str(len(candidates)), candidate_count)
     canvas.setLineWidth(line_width)
     canvas.setStrokeColor(outline)
     for i, candidate in enumerate(candidates):
@@ -231,19 +275,27 @@ def main() -> None:
     with pdfplumber.open(args.base_pdf) as base:
         existing = [line["text"] for line in base.pages[0].extract_text_lines()
                     if line["text"].strip().endswith(" DISTRICT")]
+        # Without a candidate_count in the JSON, the base's count is left as it is.
+        candidate_count = rendering.get("candidate_count")
+        if candidate_count:
+            # The number is being changed in the base, so match the base rather than the reference ballot.
+            candidate_count = find_candidate_count(base.pages[0], candidate_count["box_text"])
     if existing:
         print(f"Warning: {args.base_pdf} already has {existing[0]!r}; each district will be drawn over it",
               file=sys.stderr)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     for electorate, candidates in electorates.items():
-        base_page = PdfReader(args.base_pdf).pages[0]
+        writer = PdfWriter()
+        base_page = writer.add_page(PdfReader(args.base_pdf).pages[0])
         page_size = (float(base_page.mediabox.width), float(base_page.mediabox.height))
-        overlay = render_overlay(electorate, candidates, rendering, page_size, args.logo_dir)
+        if candidate_count:
+            font = register_font(candidate_count["font_faces"][0])
+            make_room_for_number(base_page, candidate_count["box_text"], candidate_count["text"],
+                                 pdfmetrics.stringWidth(str(len(candidates)), font, 1000))
+        overlay = render_overlay(electorate, candidates, rendering, page_size, args.logo_dir, candidate_count)
         base_page.merge_page(PdfReader(overlay).pages[0])
 
-        writer = PdfWriter()
-        writer.add_page(base_page)
         output = args.output_dir / f"{electorate}.pdf"
         with output.open("wb") as f:
             writer.write(f)
