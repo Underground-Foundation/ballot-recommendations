@@ -32,8 +32,29 @@ def distinct(values) -> list:
     return list({json.dumps(v, sort_keys=True): v for v in values}.values())
 
 
-def describe_text(page, text_box) -> dict:
-    """Describe the fonts and position of some text, given its bounding box and characters."""
+def describe_horizontal_text(page, text_box) -> dict:
+    """Describe the fonts and position of some text, given its bounding box and characters.
+
+    The position is given in points, measured as follows. top_pt is measured down from the top of the page, but
+    baseline_pt is measured up from the bottom (PDF coordinates). The baseline is the line where the letters sit.
+    Descending letters (eg "g"), dip below it to the bottom of the text box. On a ballot, the candidate's empty box
+    (described separately, by find_left_box) is to the left of the text.
+
+        ┌──────────────────────────────────────────────────────────────┐ ─┬─ top of page
+        │                       ▲                                      │  │
+        │                       │ top_pt                               │  │
+        │                       ▼                                      │  │
+        │     ┌─────┐     ┌───────────────┐ ◄─ top of text box         │  │
+        │     │     │     │  HALL, Katie  │                            │  │
+        │     │     │     │╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌│╌╌╌┬ ◄─ baseline            │  │ page_size_pt["height"]
+        │     └─────┘     └───────────────┘   │ ◄─ bottom of text box  │  │
+        │     empty box                       │                        │  │
+        │     (left_box)                      │                        │  │
+        │◄───── x_pt ────►                    │ baseline_pt            │  │
+        │                                     ▼                        │  │
+        └──────────────────────────────────────────────────────────────┘ ─┴─ bottom of page
+        ◄─────────────────── page_size_pt["width"] ────────────────────►
+    """
     chars = [c for c in text_box["chars"] if not c["text"].isspace()]
     return {
         "page": page.page_number,
@@ -51,14 +72,20 @@ def describe_text(page, text_box) -> dict:
     }
 
 
-DISTRICT_SUFFIX = "DISTRICT"
+# The word following the electorate's name on each house's ballot.
+ELECTORATE_SUFFIXES = {
+    "Legislative Assembly": "DISTRICT",
+    "Legislative Council": "REGION",
+}
 
 
-def find_district_text(page) -> dict | None:
-    """Describe the first line of the page that reads "<name> DISTRICT", eg "FOOTSCRAY DISTRICT"."""
+def find_district_text(page, house: str) -> dict | None:
+    """Describe the first line of the page that names the house's electorate, eg "FOOTSCRAY DISTRICT" for the
+    Legislative Assembly or "SOUTHERN METROPOLITAN REGION" for the Legislative Council."""
+    suffix = ELECTORATE_SUFFIXES[house]
     for line in page.extract_text_lines(return_chars=True):
-        if re.fullmatch(rf"\S.*\s{DISTRICT_SUFFIX}", line["text"].strip()):
-            return describe_text(page, line)
+        if re.fullmatch(rf"\S.*\s{suffix}", line["text"].strip()):
+            return describe_horizontal_text(page, line)
     return None
 
 
@@ -79,7 +106,7 @@ def find_candidate_count(page, box_text: str) -> dict:
     matrix = last["chars"][0]["matrix"]
     return {
         "box_text": box_text,
-        **describe_text(page, last),
+        **describe_horizontal_text(page, last),
         # Text may be condensed, eg the sidebar of the base ballot, so the width isn't given by the size alone.
         "horizontal_scale": round(abs(matrix[0] / matrix[3]), 4),
     }
@@ -108,7 +135,7 @@ def find_party_text(page, match) -> dict | None:
             break
         line.append(word)
 
-    return describe_text(page, {
+    return describe_horizontal_text(page, {
         "text": " ".join(w["text"] for w in line),
         "chars": [c for w in line for c in w["chars"]],
         "x0": first["x0"],
@@ -222,6 +249,8 @@ def find_boxes_to_left(page, x0, x1, top, bottom) -> list[dict]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pdf", type=Path, help="path of the PDF file to inspect, eg Footscray.pdf")
+    parser.add_argument("--house", choices=ELECTORATE_SUFFIXES, default="Legislative Assembly",
+                        help="the house the ballot is for (default: %(default)s)")
     parser.add_argument("--candidate-text", required=True, help="candidate text to find, eg 'HALL, Katie'")
     parser.add_argument("--candidate-count", metavar="TEXT", nargs="+", action="extend",
                         help="any text unique to each line stating the candidate count as its last number, "
@@ -236,10 +265,10 @@ def main() -> None:
         for page in pdf.pages:
             for match in page.search(args.candidate_text, regex=False, return_chars=True):
                 details = {
-                    "candidate_text": describe_text(page, match),
+                    "candidate_text": describe_horizontal_text(page, match),
                     "left_box": find_left_box(page, match),
                     "party_text": find_party_text(page, match),
-                    "district_text": find_district_text(page),
+                    "district_text": find_district_text(page, args.house),
                 }
                 if args.candidate_count:
                     details["candidate_count"] = [find_candidate_count(page, text) for text in args.candidate_count]
