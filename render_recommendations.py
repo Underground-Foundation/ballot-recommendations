@@ -37,13 +37,27 @@ SCORE_COLUMN = "Recommendation"
 SCORE_COLOURS = {"G": "#01A300", "O": "#FF831F", "R": "#FF0000"}
 
 
-def read_electorates(path: Path) -> dict[str, list[dict[str, str]]]:
-    """Group the CSV's candidates by electorate, keeping only electorates with a recommendation for someone."""
+def filter_rows(rows: list[dict[str, str]], column: str, value: str | None, path: Path) -> list[dict[str, str]]:
+    """Keep the rows whose column matches the value, ignoring case and surrounding spaces (all rows if no value)."""
+    if value is None:
+        return rows
+    kept = [row for row in rows if row.get(column, "").strip().casefold() == value.strip().casefold()]
+    if not kept:
+        available = sorted({row.get(column, "").strip() for row in rows} - {""})
+        sys.exit(f"No candidates in {path} with {column} {value!r}; choose from: {', '.join(available)}")
+    return kept
+
+
+def read_electorates(path: Path, house: str, electorate: str | None = None) -> dict[str, list[dict[str, str]]]:
+    """Group the house's candidates in the CSV by electorate, keeping only electorates with a recommendation for
+    someone. If an electorate is given, only its candidates are kept."""
     try:
         with path.open(newline="", encoding="utf-8-sig") as f:
             rows = list(csv.DictReader(f))
     except FileNotFoundError:
         sys.exit(f"Input file not found: {path}")
+    rows = filter_rows(rows, "House", house, path)
+    rows = filter_rows(rows, "Electorate", electorate, path)
 
     electorates: dict[str, list[dict[str, str]]] = {}
     for row in rows:
@@ -130,14 +144,19 @@ def draw_with_style_reference(canvas: Canvas, text: str, reference: dict) -> Non
     """Draw the text with the font, colour and position of the given text on the reference ballot."""
     font = register_font(reference["font_faces"][0])
     size = reference["sizes_pt"][0]
-    canvas.setFont(font, size)
-    canvas.setFillColor(get_text_colour(reference))
+    canvas.saveState()  # as the horizontal scale would otherwise carry over to later text
     # The baseline is already measured up from the bottom of the page, as ReportLab expects.
-    canvas.drawString(reference["x_pt"], reference["baseline_pt"], text)
+    text_object = canvas.beginText(reference["x_pt"], reference["baseline_pt"])
+    text_object.setFont(font, size)
+    text_object.setHorizScale(reference.get("horizontal_scale", 1) * 100)
+    text_object.setFillColor(get_text_colour(reference))
+    text_object.textOut(text)
+    canvas.drawText(text_object)
+    canvas.restoreState()
 
 
 def make_room_for_number(page: PageObject, box_text: str, number: str, gap: float) -> None:
-    """Remove the number from the page's text showing box_text, leaving a gap for its replacement. The gap is in
+    """Remove the number, the last in the page's text showing box_text, leaving a gap for its replacement. The gap is in
     thousandths of the text's font size, and moves the text after the number along to suit the replacement's width."""
     squeeze = lambda text: "".join(text.split())  # spaces may be drawn as gaps rather than as characters
     content = ContentStream(page.get_contents(), page.pdf)
@@ -145,10 +164,11 @@ def make_room_for_number(page: PageObject, box_text: str, number: str, gap: floa
         if operator != b"TJ":
             continue
         text = "".join(item for item in operands[0] if isinstance(item, str))
-        found = re.search(rf"(?<!\d){number}(?!\d)", text)
-        if not found or squeeze(box_text) not in squeeze(text):
+        numbers = list(re.finditer(r"\d+", text))
+        if not numbers or numbers[-1].group() != number or squeeze(box_text) not in squeeze(text):
             continue
 
+        found = numbers[-1]
         spliced = ArrayObject()
         position = 0
         gap_added = False
@@ -175,7 +195,7 @@ def make_room_for_number(page: PageObject, box_text: str, number: str, gap: floa
 
 
 def render_overlay(electorate: str, candidates: list[dict[str, str]], rendering: dict,
-                   page_size: tuple[float, float], logo_dir: Path, candidate_count: dict | None) -> BytesIO:
+                   page_size: tuple[float, float], logo_dir: Path, candidate_counts: list[dict]) -> BytesIO:
     """Draw the district name, candidate rows and any candidate count on a transparent page, to be laid over
     the base ballot PDF."""
     candidate_text, box, party_text = rendering["candidate_text"], rendering["left_box"], rendering["party_text"]
@@ -201,7 +221,7 @@ def render_overlay(electorate: str, candidates: list[dict[str, str]], rendering:
     buffer = BytesIO()
     canvas = Canvas(buffer, pagesize=page_size)
     draw_with_style_reference(canvas, f"{electorate.upper()} DISTRICT", rendering["district_text"])
-    if candidate_count:
+    for candidate_count in candidate_counts:
         draw_with_style_reference(canvas, str(len(candidates)), candidate_count)
     canvas.setLineWidth(line_width)
     canvas.setStrokeColor(outline)
@@ -253,6 +273,9 @@ def main() -> None:
                         help=f"directory of party logos (default: {DEFAULT_LOGO_DIR})")
     parser.add_argument("--output-dir", type=Path, default=Path(DEFAULT_OUTPUT_DIR),
                         help=f"directory to write a PDF per electorate into (default: {DEFAULT_OUTPUT_DIR})")
+    parser.add_argument("--electorate", help="render only this electorate, eg Footscray (default: all)")
+    parser.add_argument("--house", required=True,
+                        help="the house whose candidates to render, eg 'Legislative Assembly'")
     args = parser.parse_args()
 
     for path in (args.rendering, args.base_pdf):
@@ -268,18 +291,17 @@ def main() -> None:
         sys.exit(f"{args.rendering} needs a match with a party_text and a left_box that has a line width, "
                  "a box below it and two boxes to its left; inspect a different candidate")
 
-    electorates = read_electorates(args.input)
+    electorates = read_electorates(args.input, args.house, args.electorate)
     if not electorates:
-        sys.exit(f"No electorate in {args.input} has a {SCORE_COLUMN}")
+        sys.exit(f"No matching electorate in {args.input} has a {SCORE_COLUMN}")
 
     with pdfplumber.open(args.base_pdf) as base:
         existing = [line["text"] for line in base.pages[0].extract_text_lines()
                     if line["text"].strip().endswith(" DISTRICT")]
-        # Without a candidate_count in the JSON, the base's count is left as it is.
-        candidate_count = rendering.get("candidate_count")
-        if candidate_count:
-            # The number is being changed in the base, so match the base rather than the reference ballot.
-            candidate_count = find_candidate_count(base.pages[0], candidate_count["box_text"])
+        # Without a candidate_count in the JSON, the base's counts are left as they are. The numbers are being changed
+        # in the base, so match the base rather than the reference ballot.
+        candidate_counts = [find_candidate_count(base.pages[0], candidate_count["box_text"])
+                            for candidate_count in rendering.get("candidate_count", [])]
     if existing:
         print(f"Warning: {args.base_pdf} already has {existing[0]!r}; each district will be drawn over it",
               file=sys.stderr)
@@ -289,11 +311,11 @@ def main() -> None:
         writer = PdfWriter()
         base_page = writer.add_page(PdfReader(args.base_pdf).pages[0])
         page_size = (float(base_page.mediabox.width), float(base_page.mediabox.height))
-        if candidate_count:
+        for candidate_count in candidate_counts:
             font = register_font(candidate_count["font_faces"][0])
             make_room_for_number(base_page, candidate_count["box_text"], candidate_count["text"],
                                  pdfmetrics.stringWidth(str(len(candidates)), font, 1000))
-        overlay = render_overlay(electorate, candidates, rendering, page_size, args.logo_dir, candidate_count)
+        overlay = render_overlay(electorate, candidates, rendering, page_size, args.logo_dir, candidate_counts)
         base_page.merge_page(PdfReader(overlay).pages[0])
 
         output = args.output_dir / f"{electorate}.pdf"

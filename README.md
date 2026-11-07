@@ -38,19 +38,23 @@ python download_candidate_scores.py [--url '<spreadsheet url>'] [--output candid
 ### Rendering 
 Before rendering, we must first discover the font etc to be used, by relying on an example PDF:
 ```
-python pdf_inspection.py Footscray.pdf --candidate-text 'HALL, Katie' --candidate-count 'Number the squares' > rendering.json
+python pdf_inspection.py Footscray.pdf --candidate-text 'HALL, Katie' --candidate-count 'Number the squares' 'them last' > rendering.json
 ```
-`--candidate-count` is optional. Give it any text unique to the line stating the number of candidates; when rendering,
-the highest number in that line of the base PDF (the 8 in "from 1 to 8") becomes the electorate's number of candidates.
+`--candidate-count` is optional. Give it any text unique to each line stating the number of candidates; when rendering,
+the last number in each of those lines of the base PDF (the 8 in "from 1 to 8" and in "(4-8)") becomes the electorate's
+number of candidates.
 Without it, the JSON has no `candidate_count` and the base PDF's numbers are left as they are.
 
 With these details, we can then render voting-guide PDFs for each of our electorates from <candidates_with_scores.csv>:
 
 ```
-python render_recommendations.py --rendering rendering.json [--base-pdf base.pdf] [--input candidates_with_scores.csv] [--output-dir ballots]
+python render_recommendations.py --rendering rendering.json --house 'Legislative Assembly' [--base-pdf base.pdf] [--input candidates_with_scores.csv] [--output-dir ballots] [--electorate Footscray]
 ```
 Each electorate's candidates are drawn onto a copy of the base PDF (a blank ballot) and saved as
 `ballots/<Electorate>.pdf`. Only electorates with a `Recommendation` for at least one candidate are rendered.
+`--house` (required) and `--electorate` (optional) are matched against the CSV's `House` and `Electorate` columns,
+ignoring case. Each ballot holds only that house's candidates; with `--electorate`, only that electorate's ballot is
+rendered.
 
 Each party's logo is the file in `party_logos/` named exactly after the party (ignoring case and file type), or else
 the only file whose name contains the party's name as whole words (ignoring anything in parentheses). Independents get no logo, and a party without a unique match gets

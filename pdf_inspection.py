@@ -1,5 +1,5 @@
 """Find candidate text in a PDF and print, as JSON, its font details (colour, size, font face and position),
-the box to its left and the party text below it, plus optionally the candidate count on the same page."""
+the box to its left and the party text below it, plus optionally the candidate counts on the same page."""
 
 import argparse
 import json
@@ -63,21 +63,26 @@ def find_district_text(page) -> dict | None:
 
 
 def find_candidate_count(page, box_text: str) -> dict:
-    """Describe the numerically highest number in the only line containing the given text, eg the 8 in
-    "Number the squares from 1 to 8". A line needs at least two numbers, so that the low end of a range is never taken
-    for the count if the count itself has been removed."""
+    """Describe the last number in the only line containing the given text, eg the 8 in "Number the squares from 1 to
+    8" or in "them last (4-8)"."""
     lines = [line for line in page.extract_text_lines() if box_text in line["text"]]
     if len(lines) != 1:
         sys.exit(f'Expected one line containing "{box_text}" on page {page.page_number}, but found {len(lines)}')
     line = lines[0]
     numbers = [
-        n for n in page.search(r"(?<!\S)\d+(?!\S)", regex=True, return_chars=True)
+        n for n in page.search(r"\d+", regex=True, return_chars=True)
         if n["x0"] >= line["x0"] and n["x1"] <= line["x1"] and n["top"] < line["bottom"] and n["bottom"] > line["top"]
     ]
-    if len(numbers) < 2:
-        sys.exit(f'Expected at least two numbers in "{line["text"]}", but found {len(numbers)}')
-    highest = max(numbers, key=lambda n: int(n["text"]))
-    return {"box_text": box_text, **describe_text(page, highest)}
+    if not numbers:
+        sys.exit(f'Expected a number in "{line["text"]}", but found none')
+    last = max(numbers, key=lambda n: n["x0"])
+    matrix = last["chars"][0]["matrix"]
+    return {
+        "box_text": box_text,
+        **describe_text(page, last),
+        # Text may be condensed, eg the sidebar of the base ballot, so the width isn't given by the size alone.
+        "horizontal_scale": round(abs(matrix[0] / matrix[3]), 4),
+    }
 
 
 def find_party_text(page, match) -> dict | None:
@@ -218,8 +223,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pdf", type=Path, help="path of the PDF file to inspect, eg Footscray.pdf")
     parser.add_argument("--candidate-text", required=True, help="candidate text to find, eg 'HALL, Katie'")
-    parser.add_argument("--candidate-count", metavar="TEXT",
-                        help="any text unique to the line stating the candidate count, eg 'Number the squares'")
+    parser.add_argument("--candidate-count", metavar="TEXT", nargs="+", action="extend",
+                        help="any text unique to each line stating the candidate count as its last number, "
+                             "eg 'Number the squares' 'them last'")
     args = parser.parse_args()
 
     if not args.pdf.is_file():
@@ -236,7 +242,7 @@ def main() -> None:
                     "district_text": find_district_text(page),
                 }
                 if args.candidate_count:
-                    details["candidate_count"] = find_candidate_count(page, args.candidate_count)
+                    details["candidate_count"] = [find_candidate_count(page, text) for text in args.candidate_count]
                 matches.append(details)
 
     if not matches:
