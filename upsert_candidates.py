@@ -1,8 +1,8 @@
 """Insert candidates from a local CSV file into the "All candidate scores" sheet of a Google Spreadsheet.
 
 The sheet is created (with the CSV's columns, plus a Recommendation column) if it doesn't exist. A candidate is
-identified by the combination of Electorate, Candidate and Party; candidates already in the sheet are left untouched.
-New rows are inserted so that the sheet stays sorted by Electorate, then Candidate, then Party.
+identified by the combination of Electorate, Candidate and Party. For candidates already in the sheet, only blank cells
+are filled in (from the CSV); existing values are never overwritten. New rows are inserted so that the sheet stays sorted by Electorate, then Candidate, then Party.
 """
 
 import argparse
@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 
 import gspread
+from gspread.utils import rowcol_to_a1
 
 from sheet import SCORES_SHEET_TITLE, add_url_argument, get_or_create_worksheet, open_spreadsheet
 
@@ -136,27 +137,39 @@ def main() -> None:
         if position < len(existing_keys):
             final_keys.append(existing_keys[position])
 
-    if not new_rows:
-        print("No new candidates to insert.")
-        add_electorate_borders(spreadsheet, worksheet, final_keys, len(header))
-        return
+    # Blank cells of existing rows that the CSV can fill in, keyed by (existing row index, column index).
+    existing_index: dict[Key, int] = {}
+    for i, key in enumerate(existing_keys):
+        existing_index.setdefault(key, i)
+    fills: dict[tuple[int, int], str] = {}
+    for row in local_rows:
+        i = existing_index.get(sort_key(identity(row)))
+        if i is None:
+            continue
+        existing_row = existing_rows[i]
+        for j, column in enumerate(header):
+            if column in KEY_COLUMNS or (j < len(existing_row) and existing_row[j].strip()):
+                continue
+            value = (row.get(column) or "").strip()
+            if value:
+                fills.setdefault((i, j), value)
 
-    # Insert blank rows bottom-up, so that earlier insertion points are unaffected; the +1 skips the header row.
-    insert_requests = [
-        {
-            "insertDimension": {
-                "range": {
-                    "sheetId": worksheet.id,
-                    "dimension": "ROWS",
-                    "startIndex": position + 1,
-                    "endIndex": position + 1 + len(group),
-                },
-                "inheritFromBefore": position > 0,
+    if new_rows and not created:
+        # Insert blank rows bottom-up, so that earlier insertion points are unaffected; the +1 skips the header row.
+        insert_requests = [
+            {
+                "insertDimension": {
+                    "range": {
+                        "sheetId": worksheet.id,
+                        "dimension": "ROWS",
+                        "startIndex": position + 1,
+                        "endIndex": position + 1 + len(group),
+                    },
+                    "inheritFromBefore": position > 0,
+                }
             }
-        }
-        for position, group in sorted(groups.items(), reverse=True)
-    ]
-    if not created:
+            for position, group in sorted(groups.items(), reverse=True)
+        ]
         spreadsheet.batch_update({"requests": insert_requests})
 
     # Fill the blank rows; each group has shifted down by the rows inserted above it.
@@ -166,11 +179,26 @@ def main() -> None:
         first_row = position + shift + 2  # 1-based, after the header
         value_updates.append({"range": f"A{first_row}", "values": [values for _, values in group]})
         shift += len(group)
-    worksheet.batch_update(value_updates, value_input_option="USER_ENTERED")
+
+    # Fill in the blank cells of existing rows, at their positions after the insertions.
+    inserted_up_to = []  # number of new rows inserted at or before each existing row
+    running = 0
+    for position in range(len(existing_keys)):
+        running += len(groups.get(position, []))
+        inserted_up_to.append(running)
+    for (i, j), value in sorted(fills.items()):
+        row_number = i + inserted_up_to[i] + 2  # 1-based, after the header
+        value_updates.append({"range": rowcol_to_a1(row_number, j + 1), "values": [[value]]})
+
+    if value_updates:
+        worksheet.batch_update(value_updates, value_input_option="USER_ENTERED")
     add_electorate_borders(spreadsheet, worksheet, final_keys, len(header))
 
-    print(f"Inserted {len(new_rows)} new candidate(s); {len(existing_rows)} were already present.")
-
+    updated_rows = len({i for i, _ in fills})
+    print(
+        f"Inserted {len(new_rows)} new candidate(s); {len(existing_rows)} were already present, "
+        f"of which {updated_rows} had {len(fills)} blank cell(s) filled in."
+    )
 
 if __name__ == "__main__":
     main()
