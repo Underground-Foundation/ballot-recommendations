@@ -1,5 +1,6 @@
 """Find candidate text in a PDF and print, as JSON, its font details (colour, size, font face and position),
-the box to its left and the party text below it, plus optionally the candidate counts on the same page."""
+the box to its left and the party text below it, plus optionally the candidate counts and any vertical text (with
+the box around it) on the same page."""
 
 import argparse
 import json
@@ -68,6 +69,187 @@ def describe_horizontal_text(page, text_box) -> dict:
         # The text matrix's translation is the glyph origin on the baseline, in PDF
         # coordinates, ie points from the bottom edge.
         "baseline_pt": round(chars[0]["matrix"][5], 2),
+        "page_size_pt": {"width": page.width, "height": page.height},
+    }
+
+
+def vertical_size(char) -> float:
+    """The font size of a character rotated a quarter turn. pdfminer's "size" of such a character is the advance
+    along the line, but the extent across the line, like an upright character's height, is the font size."""
+    return char["x1"] - char["x0"]
+
+
+def vertical_lines(page) -> list[list[dict]]:
+    """Group the page's characters rotated a quarter turn into lines, each in reading order. Text rotated
+    anticlockwise reads upward and its later lines are to the right; text rotated clockwise is the reverse."""
+    columns = {}
+    for c in page.chars:
+        a, b = c["matrix"][:2]
+        if c["upright"] or abs(a) > 1e-6 or b == 0:
+            continue
+        # The characters of a line share a baseline, the vertical line through each glyph's origin.
+        columns.setdefault((b > 0, round(c["matrix"][4], 1)), []).append(c)
+    lines = []
+    for (upward, _), chars in sorted(columns.items()):
+        chars.sort(key=lambda c: c["matrix"][5], reverse=not upward)
+        line = [chars[0]]
+        for prev, c in zip(chars, chars[1:]):
+            # Split the column where there is a gap, eg between different parties' names.
+            gap = prev["top"] - c["bottom"] if upward else c["top"] - prev["bottom"]
+            if gap > vertical_size(c):
+                lines.append(line)
+                line = []
+            line.append(c)
+        lines.append(line)
+    return lines
+
+
+def vertical_blocks(page) -> list[list[list[dict]]]:
+    """Group the vertical lines into blocks of consecutive lines, in reading order, eg a party name over two lines."""
+    def is_next(line, following) -> bool:
+        upward = line[0]["matrix"][1] > 0
+        if (following[0]["matrix"][1] > 0) != upward:
+            return False
+        step = (following[0]["matrix"][4] - line[0]["matrix"][4]) * (1 if upward else -1)
+        overlaps = (min(c["top"] for c in following) < max(c["bottom"] for c in line)
+                    and max(c["bottom"] for c in following) > min(c["top"] for c in line))
+        return overlaps and 0 < step <= 2 * max(vertical_size(c) for c in line)
+
+    lines = sorted(vertical_lines(page), key=lambda l: l[0]["matrix"][4] * (1 if l[0]["matrix"][1] > 0 else -1))
+    blocks = []
+    for line in lines:
+        block = next((b for b in blocks if is_next(b[-1], line)), None)
+        if block is None:
+            blocks.append([line])
+        else:
+            block.append(line)
+    return blocks
+
+
+def find_vertical_text(page, text: str) -> list[dict] | None:
+    """The characters, in reading order, of the first match of the text among the page's vertical text, where any
+    whitespace in the text, including a line break, matches any whitespace."""
+    wanted = " ".join(text.split())
+    for block in vertical_blocks(page):
+        # Each character of the block's text, with whitespace collapsed to one space, and its source character.
+        sequence = []
+        for line in block:
+            for c in line + [None]:  # a line break is whitespace
+                char_text = " " if c is None or c["text"].isspace() else c["text"]
+                if char_text == " " and (not sequence or sequence[-1][0] == " "):
+                    continue
+                sequence.append((char_text, c))
+        start = "".join(t for t, _ in sequence).find(wanted)
+        if start >= 0:
+            return [c for _, c in sequence[start:start + len(wanted)] if c is not None]
+    return None
+
+
+def find_bounding_box(page, x0, top, x1, bottom) -> dict | None:
+    """Describe the smallest rect or curve that contains the given area, and any upright text inside it."""
+    tolerance = 0.5
+    containing = [
+        s for s in page.rects + page.curves
+        if s["x0"] <= x0 + tolerance and s["top"] <= top + tolerance
+        and s["x1"] >= x1 - tolerance and s["bottom"] >= bottom - tolerance
+    ]
+    if not containing:
+        return None
+    smallest = min(containing, key=lambda s: s["width"] * s["height"])
+    # There may be several shapes of the same size, eg one filled and one stroked.
+    shapes = [s for s in containing if all(abs(s[k] - smallest[k]) <= tolerance for k in ("x0", "top", "x1", "bottom"))]
+
+    def inside(item) -> bool:
+        return (item["x0"] >= smallest["x0"] - tolerance and item["x1"] <= smallest["x1"] + tolerance
+                and item["top"] >= smallest["top"] - tolerance and item["bottom"] <= smallest["bottom"] + tolerance)
+
+    other_text = [
+        describe_horizontal_text(page, word)
+        for word in page.extract_words(return_chars=True)
+        if inside(word) and word["upright"]
+    ]
+    return {
+        "x_pt": round(smallest["x0"], 2),
+        "top_pt": round(smallest["top"], 2),
+        "right_pt": round(smallest["x1"], 2),
+        "bottom_pt": round(smallest["bottom"], 2),
+        "width_pt": round(smallest["width"], 2),
+        "height_pt": round(smallest["height"], 2),
+        "fill_colours": distinct(format_colour(s["non_stroking_color"]) for s in shapes if s["fill"]),
+        "stroke_colours": distinct(format_colour(s["stroking_color"]) for s in shapes if s["stroke"]),
+        "line_widths_pt": distinct(s["linewidth"] for s in shapes if s["stroke"]),
+        "other_text": other_text,
+    }
+
+
+def describe_vertical_text(page, text: str) -> dict | None:
+    """Describe the fonts and position of some text rotated a quarter turn, eg a party name on an upper house
+    ballot, and the box that visually bounds it. The text may span several lines, eg "DEMOCRATIC LABOUR PARTY".
+
+    In this diagram the letters are drawn upright, but on the page they are rotated a quarter turn anticlockwise,
+    so each line reads upward and later lines are to its right. Each line's baseline (╎) is then a vertical line
+    to the right of its letters, and its origin (●), where the baseline starts, is at the bottom.
+
+    All positions are in points (1/72 inch). As in describe_horizontal_text, x_pt, top_pt, right_pt and bottom_pt
+    are measured from the top-left of the page, but each line's start_pt is measured up from the bottom of the
+    page (PDF coordinates). Each line's baseline_x_pt and start_pt are the origin at which to draw that line,
+    rotated, at its size.
+
+        ┌─────────────────────────────────────────────────────────────┐ ─ top of page
+        │           ▲                                                 │
+        │   ┌───────┼─────────────────┐ ◄ bounding_box["top_pt"]      │
+        │   │       │ top_pt          │                               │
+        │   │       ▼                 │                               │
+        │   │   ┌───────┐             │                               │
+        │   │   │    Y╎ │             │                               │
+        │   │   │ C╎ T╎ │             │                               │
+        │   │   │ I╎ R╎ │             │                               │
+        │   │   │ T╎ A╎ │             │                               │
+        │   │   │ ┊╎ P╎ │             │                               │
+        │   │   │ M╎ ┊╎ │             │                               │
+        │   │   │ E╎ B╎ │             │                               │
+        │   │   │ D● A╎ │             │                               │
+        │   │   │    L● │             │                               │
+        │   │   └─────┼─┘ ◄───────────┼── bottom_pt                   │
+        │   │         │               │                               │
+        │   │         │               │                               │
+        │   │         │     R ◄───────┼── bounding_box["other_text"]  │
+        │   │         │               │                               │
+        │   └─────────┼───────────────┘ ◄ bounding_box["bottom_pt"]   │
+        │◄─────► x_pt │                                               │
+        │◄────────►   │ start_pt (of the second line)                 │
+        │baseline_x_pt▼                                               │
+        └─────────────────────────────────────────────────────────────┘ ─ bottom of page
+    """
+    matched = find_vertical_text(page, text)
+    if matched is None:
+        return None
+    lines = {}
+    for c in matched:
+        lines.setdefault(round(c["matrix"][4], 1), []).append(c)
+    chars = [c for c in matched if not c["text"].isspace()]
+    x0, top = min(c["x0"] for c in chars), min(c["top"] for c in chars)
+    x1, bottom = max(c["x1"] for c in chars), max(c["bottom"] for c in chars)
+    return {
+        "page": page.page_number,
+        "text": " ".join("".join(c["text"] for c in line).strip() for line in lines.values()),
+        "direction": "upward" if chars[0]["matrix"][1] > 0 else "downward",
+        "font_faces": distinct(c["fontname"] for c in chars),
+        "sizes_pt": distinct(round(vertical_size(c), 3) for c in chars),
+        "colours": distinct(format_colour(c["non_stroking_color"]) for c in chars),
+        "x_pt": round(x0, 2),
+        "top_pt": round(top, 2),
+        "right_pt": round(x1, 2),
+        "bottom_pt": round(bottom, 2),
+        "lines": [
+            {
+                "text": "".join(c["text"] for c in line).strip(),
+                "baseline_x_pt": round(line[0]["matrix"][4], 2),
+                "start_pt": round(next(c for c in line if not c["text"].isspace())["matrix"][5], 2),
+            }
+            for line in lines.values()
+        ],
+        "bounding_box": find_bounding_box(page, x0, top, x1, bottom),
         "page_size_pt": {"width": page.width, "height": page.height},
     }
 
@@ -255,6 +437,9 @@ def main() -> None:
     parser.add_argument("--candidate-count", metavar="TEXT", nargs="+", action="extend",
                         help="any text unique to each line stating the candidate count as its last number, "
                              "eg 'Number the squares' 'them last'")
+    parser.add_argument("--vertical-text", metavar="TEXT", nargs="+", action="extend",
+                        help="any text rotated a quarter turn on the same page to describe, with the box around it, "
+                             "eg 'DEMOCRATIC LABOUR PARTY'")
     args = parser.parse_args()
 
     if not args.pdf.is_file():
@@ -272,6 +457,13 @@ def main() -> None:
                 }
                 if args.candidate_count:
                     details["candidate_count"] = [find_candidate_count(page, text) for text in args.candidate_count]
+                if args.vertical_text:
+                    details["vertical_text"] = []
+                    for text in args.vertical_text:
+                        description = describe_vertical_text(page, text)
+                        if description is None:
+                            sys.exit(f'Vertical text "{text}" not found on page {page.page_number} of {args.pdf}')
+                        details["vertical_text"].append(description)
                 matches.append(details)
 
     if not matches:

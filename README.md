@@ -20,13 +20,13 @@ a CSV with all the candidates (using eg
 [candidate-scraping](https://github.com/Underground-Foundation/candidate-scraping)), then use it to initialise the
 sheet:
 ```
-python upsert_candidates.py [--url '<spreadsheet url>'] [--input candidates.csv]
+python update_remote_candidates.py [--url '<spreadsheet url>'] [--input candidates.csv] [--replace-names] [--with-candidate-removal]
 ```
 This will create a sheet "All candidate scores".
 
 To give every candidate of a party the same recommendation in the sheet (matching the party name, ignoring case):
 ```
-python apply_recommendations_remotely.py [--url '<spreadsheet url>'] --party Fusion --recommendation G
+python apply_recommendations_remotely.py [--url '<spreadsheet url>'] --party Fusion --recommendation G [--replace]
 ```
 
 Once you have made scores / recommendations about each row, download your finished sheet (the default filename is 
@@ -40,9 +40,16 @@ Before rendering, we must first discover the font etc to be used, by relying on 
 ```
 python pdf_inspection.py Footscray.pdf --candidate-text 'HALL, Katie' --candidate-count 'Number the squares' 'them last' > rendering.json
 ```
+Make sure the example candidate is the one at the top of the page. 
 `--candidate-count` is optional. Give it any text unique to each line stating the number of candidates; when rendering,
 the last number in each of those lines of the base PDF (the 8 in "from 1 to 8" and in "(4-8)") becomes the electorate's
 number of candidates.
+
+For a Legislative Council ballot, add `--house 'Legislative Council'`. `--vertical-text` is optional: give it any
+text rotated a quarter turn, eg a party name above the line, to describe its fonts and position and the box around it:
+```
+python pdf_inspection.py southern_metro.pdf --house 'Legislative Council' --candidate-text '...' --vertical-text 'DEMOCRATIC LABOUR PARTY'
+```
 Without it, the JSON has no `candidate_count` and the base PDF's numbers are left as they are.
 
 With these details, we can then render voting-guide PDFs for each of our electorates from <candidates_with_scores.csv>:

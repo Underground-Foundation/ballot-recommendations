@@ -17,6 +17,8 @@ def main() -> None:
     add_url_argument(parser)
     parser.add_argument("--party", required=True, help="party whose candidates to update (ignoring case), eg Liberal")
     parser.add_argument("--recommendation", required=True, help="recommendation to give them, eg R")
+    parser.add_argument("--replace", action="store_true",
+                        help="overwrite candidates that already have a different recommendation (otherwise they're skipped)")
     args = parser.parse_args()
 
     spreadsheet = open_spreadsheet(parser, args.url)
@@ -34,21 +36,33 @@ def main() -> None:
     party = args.party.strip().casefold()
     matching = 0
     updates = []
+    conflicts = []  # (row number, existing recommendation) left alone because --replace wasn't given
     for row_number, row in enumerate(rows, start=2):  # 1-based, after the header
         cells = row + [""] * (len(header) - len(row))
         if cells[party_index].strip().casefold() != party:
             continue
         matching += 1
-        if cells[recommendation_index] != args.recommendation:
-            updates.append({"range": rowcol_to_a1(row_number, recommendation_index + 1),
-                            "values": [[args.recommendation]]})
+        existing = cells[recommendation_index]
+        if existing == args.recommendation:
+            continue
+        if existing.strip() and not args.replace:
+            conflicts.append((row_number, existing))
+            continue
+        updates.append({"range": rowcol_to_a1(row_number, recommendation_index + 1),
+                        "values": [[args.recommendation]]})
 
     if not matching:
         sys.exit(f'No candidates of party "{args.party}" in sheet "{worksheet.title}".')
     if updates:
         worksheet.batch_update(updates, value_input_option="USER_ENTERED")
+    already = matching - len(updates) - len(conflicts)
     print(f'Set {RECOMMENDATION_COLUMN} to "{args.recommendation}" for {len(updates)} of the {matching} candidate(s) '
-          f'of party "{args.party}" ({matching - len(updates)} already had it).')
+          f'of party "{args.party}" ({already} already had it, {len(conflicts)} skipped).')
+    if conflicts:
+        print(f"Skipped {len(conflicts)} candidate(s) that already have a different {RECOMMENDATION_COLUMN} "
+              f"(rerun with --replace to overwrite):", file=sys.stderr)
+        for row_number, existing in conflicts:
+            print(f'  row {row_number}: "{existing}"', file=sys.stderr)
 
 
 if __name__ == "__main__":
