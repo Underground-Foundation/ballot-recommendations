@@ -8,6 +8,10 @@ already in the sheet, only blank cells are filled in (from the CSV); existing va
 that --replace-names replaces the sheet's spelling of a candidate's name with the CSV's. New rows are inserted so that
 the sheet stays sorted by Electorate, then Candidate, then Party.
 
+With --sort (which requires --with-candidate-removal), the sheet's rows are then reordered to follow the CSV's row
+order. Rows the CSV lacks that survive the removal (those in electorates the CSV has no candidates for) go after the
+CSV's rows, in their existing order.
+
 With --with-candidate-removal, rows of the sheet whose candidate isn't in the CSV are deleted, but only in electorates
 that the CSV has candidates for; rows in other electorates are left alone.
 """
@@ -158,8 +162,55 @@ def add_electorate_cell_borders(
     spreadsheet.batch_update({"requests": requests})
 
 
+def sort_rows(spreadsheet: gspread.Spreadsheet, worksheet: gspread.Worksheet, order: list[int]) -> None:
+    """Reorder the sheet's data rows so that the row now at index order[k] ends up at index k.
+
+    Each row's rank is written to a temporary column, which the rows are then sorted by and which is then deleted, all
+    in one atomic batch. Moving whole rows (rather than rewriting their values) keeps their formulas and formatting.
+    """
+    rank_column = worksheet.col_count  # 0-based index of the column about to be appended
+    ranks = [0] * len(order)
+    for k, i in enumerate(order):
+        ranks[i] = k
+    data_range = {"sheetId": worksheet.id, "startRowIndex": 1, "endRowIndex": len(order) + 1}
+    spreadsheet.batch_update(
+        {
+            "requests": [
+                {"appendDimension": {"sheetId": worksheet.id, "dimension": "COLUMNS", "length": 1}},
+                {
+                    "updateCells": {
+                        "range": {**data_range, "startColumnIndex": rank_column, "endColumnIndex": rank_column + 1},
+                        "rows": [{"values": [{"userEnteredValue": {"numberValue": r}}]} for r in ranks],
+                        "fields": "userEnteredValue",
+                    }
+                },
+                {
+                    "sortRange": {
+                        "range": {**data_range, "startColumnIndex": 0, "endColumnIndex": rank_column + 1},
+                        "sortSpecs": [{"dimensionIndex": rank_column, "sortOrder": "ASCENDING"}],
+                    }
+                },
+                {
+                    "deleteDimension": {
+                        "range": {
+                            "sheetId": worksheet.id,
+                            "dimension": "COLUMNS",
+                            "startIndex": rank_column,
+                            "endIndex": rank_column + 1,
+                        }
+                    }
+                },
+            ]
+        }
+    )
+
+
 def update_remote_candidates(
-    spreadsheet: gspread.Spreadsheet, input_path: Path, replace_names: bool = False, remove_candidates: bool = False
+    spreadsheet: gspread.Spreadsheet,
+    input_path: Path,
+    replace_names: bool = False,
+    remove_candidates: bool = False,
+    sort: bool = False,
 ) -> None:
     """Insert the candidates from the CSV at input_path into the scores sheet of the spreadsheet, creating the sheet if
     needed, fill in the blank cells of candidates already there and, if remove_candidates, delete the sheet's
@@ -186,7 +237,7 @@ def update_remote_candidates(
         print(f'Found existing sheet "{worksheet.title}" in "{spreadsheet.title}" ({worksheet.url})')
 
     existing_keys = [sort_key(identity(dict(zip(header, row)))) for row in existing_rows]
-    if existing_keys != sorted(existing_keys):
+    if not sort and existing_keys != sorted(existing_keys):
         print("Warning: the sheet isn't sorted by Electorate, Candidate, Party; new rows may be out of order.")
 
     local_keys = [sort_key(identity(row)) for row in local_rows]
@@ -209,18 +260,27 @@ def update_remote_candidates(
         for i, key in enumerate(existing_keys):
             if key[electorate_column] in local_electorates and i not in matched and key not in local_key_set:
                 removed.add(i)
-                electorate, name, party = identity(dict(zip(header, existing_rows[i])))
-                print(f'Removing "{name}" ({electorate}, {party}), who isn\'t in {input_path}')
+                record = dict(zip(header, existing_rows[i]))
+                electorate, name, party = identity(record)
+                recommendation = (record.get(RECOMMENDATION_COLUMN) or "").strip()
+                print(
+                    f'Removing "{name}" ({electorate}, {party}), who isn\'t in {input_path}; '
+                    + (f'their recommendation was "{recommendation}"' if recommendation else "they had no recommendation")
+                )
 
     # Candidates not yet in the sheet, deduplicated and sorted.
     seen: set[Key] = set()
     new_rows: list[tuple[Key, list[str]]] = []
+    new_row_index: dict[Key, int] = {}  # each new row's (first) CSV row index
     for n, row in enumerate(local_rows):
         key = local_keys[n]
         if n in matches or key in seen:
             continue
         seen.add(key)
+        new_row_index[key] = n
         new_rows.append((key, [(row.get(c) or "").strip() for c in header]))
+        electorate, name, party = identity(row)
+        print(f'Inserting "{name}" ({electorate}, {party})')
     new_rows.sort(key=lambda item: item[0])
 
     # Group the new rows by where they belong among the existing (data) rows.
@@ -229,11 +289,30 @@ def update_remote_candidates(
         groups.setdefault(bisect.bisect_right(existing_keys, key), []).append((key, values))
 
     # The sheet's data rows once the new rows are inserted, in order.
+    # With --sort, each row also gets a rank giving its place in the CSV's order: a row the CSV has comes at its (first)
+    # CSV row; an unmatched row whose key the CSV has (a duplicate) comes just after that CSV row; and any other row
+    # (in an electorate that the CSV lacks) comes after all of the CSV's rows, in its current order.
+    first_local_index: dict[Key, int] = {}
+    for n, key in enumerate(local_keys):
+        first_local_index.setdefault(key, n)
+    matched_local_index: dict[int, int] = {}
+    for n, i in matches.items():
+        matched_local_index[i] = min(n, matched_local_index.get(i, n))
     final_keys: list[Key] = []
+    final_ranks: list[tuple[int, int, int]] = []
     for position in range(len(existing_keys) + 1):
-        final_keys.extend(key for key, _ in groups.get(position, []))
+        for key, _ in groups.get(position, []):
+            final_keys.append(key)
+            final_ranks.append((new_row_index[key], 0, 0))
         if position < len(existing_keys) and position not in removed:
-            final_keys.append(existing_keys[position])
+            key = existing_keys[position]
+            final_keys.append(key)
+            if position in matched_local_index:
+                final_ranks.append((matched_local_index[position], 0, 0))
+            elif key in first_local_index:
+                final_ranks.append((first_local_index[key], 1, position))
+            else:
+                final_ranks.append((len(local_rows), 0, position))
 
     # Blank cells of existing rows that the CSV can fill in, keyed by (existing row index, column index), plus
     # candidate names to respell if --replace-names was given.
@@ -311,6 +390,14 @@ def update_remote_candidates(
                 }
             )
         spreadsheet.batch_update({"requests": delete_requests})
+
+    sorted_rows = 0
+    if sort:
+        order = sorted(range(len(final_keys)), key=lambda p: final_ranks[p])
+        sorted_rows = sum(1 for k, p in enumerate(order) if k != p)
+        if sorted_rows:
+            sort_rows(spreadsheet, worksheet, order)
+            final_keys = [final_keys[p] for p in order]
     add_electorate_cell_borders(spreadsheet, worksheet, final_keys, len(header))
 
     updated_rows = len({i for i, _ in fills})
@@ -318,7 +405,9 @@ def update_remote_candidates(
         f"Inserted {len(new_rows)} new candidate(s); {len(existing_rows)} were already present, "
         f"of which {updated_rows} had {len(fills) - renamed} blank cell(s) filled in"
         + (f" and {renamed} name(s) respelt" if replace_names else "")
-        + (f"; removed {len(removed)} candidate(s) not in the CSV." if remove_candidates else ".")
+        + (f"; removed {len(removed)} candidate(s) not in the CSV" if remove_candidates else "")
+        + (f"; moved {sorted_rows} row(s) into the CSV's order" if sort else "")
+        + "."
     )
 
 
@@ -341,11 +430,22 @@ def main() -> None:
         action="store_true",
         help="delete the sheet's candidates that aren't in the CSV, in the electorates that the CSV has candidates for",
     )
+    parser.add_argument(
+        "--sort",
+        action="store_true",
+        help="reorder the sheet's rows to follow the CSV's row order; requires --with-candidate-removal",
+    )
     args = parser.parse_args()
+    if args.sort and not args.with_candidate_removal:
+        parser.error("--sort requires --with-candidate-removal")
 
     spreadsheet = open_spreadsheet(parser, args.url)
     update_remote_candidates(
-        spreadsheet, args.input, replace_names=args.replace_names, remove_candidates=args.with_candidate_removal
+        spreadsheet,
+        args.input,
+        replace_names=args.replace_names,
+        remove_candidates=args.with_candidate_removal,
+        sort=args.sort,
     )
 
 

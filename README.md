@@ -20,7 +20,7 @@ a CSV with all the candidates (using eg
 [candidate-scraping](https://github.com/Underground-Foundation/candidate-scraping)), then use it to initialise the
 sheet:
 ```
-python update_remote_candidates.py [--url '<spreadsheet url>'] [--input candidates.csv] [--replace-names] [--with-candidate-removal]
+python update_remote_candidates.py [--url '<spreadsheet url>'] [--input candidates.csv] [--replace-names] [--with-candidate-removal] [--sort]
 ```
 This will create a sheet "All candidate scores".
 
