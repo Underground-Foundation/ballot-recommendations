@@ -52,6 +52,30 @@ python pdf_inspection.py southern_metro.pdf --house 'Legislative Council' --cand
 ```
 Without it, the JSON has no `candidate_count` and the base PDF's numbers are left as they are.
 
+`--recommendation` is optional and may be repeated. Give it a recommendation and any text in the block of text
+stating how many candidates have that recommendation (ignoring case and line breaks), eg
+`--recommendation G 'Number Green Light candidates'`. The JSON then has a `recommendations` object, keyed by
+recommendation, describing each whole block (its lines, fonts, alignment and bounding box) so that it can be replaced.
+Each also has a `border`, the shape around the block (eg the rounded rectangle with the thick green outline: its
+bounds, `corner_radius_pt` with the corners' horizontal and vertical radii, fill and stroke colours and line width),
+and a `heading`, the text above the block inside the border (eg "GREEN"), described like the block, with the
+`background` behind it (eg the black rectangle).
+
+`--electorate-name` is optional. Give it the electorate's name as written in a sentence on the reference ballot
+(case-sensitive, as whole words), eg for the sentence "Kew is a Red Light electorate!":
+```
+python pdf_inspection.py Kew.pdf --candidate-text 'THEODOSIS, Katerine' --electorate-name Kew > rendering.json
+```
+The JSON then has a `replaceable_electorate_name`, with the `replaceable_text` and its fonts, and the `block` of text
+containing it, described like a recommendation's block, plus its `runs`: its text split by style (font, size, colour
+and horizontal scale), with the name in a run of its own. When rendering, that block's text is removed from the base
+PDF and redrawn with each electorate's name in the name's style. The rest of the sentence moves to make room: the
+words are re-wrapped to the width of the reference's widest line and kept to its alignment (eg centred), and if the
+sentence then needs more lines than the reference, its text is shrunk until it fits, eg
+"Narre Warren South is a / Red Light electorate!".
+
+To run the tests: `python -m unittest discover -s tests -t .`
+
 With these details, we can then render voting-guide PDFs for each of our electorates from <candidates_with_scores.csv>:
 
 ```
@@ -59,10 +83,15 @@ python render_recommendations.py --rendering rendering.json --house 'Legislative
 ```
 Each electorate's candidates are drawn onto a copy of the base PDF (a blank ballot) and saved as
 `ballots/<Electorate>.pdf`. Only electorates with a `Recommendation` for at least one candidate are rendered.
+
+If the rendering JSON has `recommendations`, each ballot gets the legend (border, heading and text) of each
+recommendation given to one of its candidates. The order of the legends, eg G, O, R, is taken from their positions
+down the reference ballot, and the legends fill those positions from the top: in an electorate with no O candidate,
+the R legend is drawn where the O legend was, so that there is no gap.
 `--house` (required) and `--electorate` (optional) are matched against the CSV's `House` and `Electorate` columns,
 ignoring case. Each ballot holds only that house's candidates; with `--electorate`, only that electorate's ballot is
 rendered.
 
 Each party's logo is the file in `party_logos/` named exactly after the party (ignoring case and file type), or else
-the only file whose name contains the party's name as whole words (ignoring anything in parentheses). Independents get no logo, and a party without a unique match gets
-none, with a warning; to fix that, add a logo named exactly after the party.
+the only file whose name contains the party's name as whole words (ignoring anything in parentheses). Independents get
+no logo, and a party without a unique match gets none, with a warning; to fix that, add a logo named exactly after the party.

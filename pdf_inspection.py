@@ -1,6 +1,7 @@
 """Find candidate text in a PDF and print, as JSON, its font details (colour, size, font face and position),
 the box to its left and the party text below it, plus optionally the candidate counts and any vertical text (with
-the box around it) on the same page."""
+the box around it), the blocks of text stating how many candidates have each recommendation and the block of text
+naming the electorate, eg "Kew is a Red Light electorate!", on the same page."""
 
 import argparse
 import json
@@ -145,19 +146,69 @@ def find_vertical_text(page, text: str) -> list[dict] | None:
     return None
 
 
-def find_bounding_box(page, x0, top, x1, bottom) -> dict | None:
-    """Describe the smallest rect or curve that contains the given area, and any upright text inside it."""
-    tolerance = 0.5
+SHAPE_TOLERANCE = 0.5  # pt
+
+
+def containing_shapes(page, x0, top, x1, bottom) -> list[dict]:
+    """The smallest rect or curve that contains the given area, with any others of the same bounds, eg one filled
+    and one stroked, or no shapes if none contains it."""
+    tolerance = SHAPE_TOLERANCE
     containing = [
         s for s in page.rects + page.curves
         if s["x0"] <= x0 + tolerance and s["top"] <= top + tolerance
         and s["x1"] >= x1 - tolerance and s["bottom"] >= bottom - tolerance
     ]
     if not containing:
-        return None
+        return []
     smallest = min(containing, key=lambda s: s["width"] * s["height"])
-    # There may be several shapes of the same size, eg one filled and one stroked.
-    shapes = [s for s in containing if all(abs(s[k] - smallest[k]) <= tolerance for k in ("x0", "top", "x1", "bottom"))]
+    return [s for s in containing if all(abs(s[k] - smallest[k]) <= tolerance for k in ("x0", "top", "x1", "bottom"))]
+
+
+def corner_radius(shape) -> dict | None:
+    """The horizontal (x) and vertical (y) radii of a rectangle's corners: 0 for a plain rectangle, or those of a
+    rectangle whose four corners are quarter ellipses (circles if the radii are equal), each drawn as a Bézier curve
+    between straight sides. None for any other shape."""
+    if shape["object_type"] == "rect":
+        return {"x": 0.0, "y": 0.0}
+    path = shape.get("path") or []
+    if sum(1 for op in path if op[0] == "c") != 4 or any(op[0] not in "mlch" for op in path):
+        return None
+    for previous, op in zip(path, path[1:]):
+        if op[0] == "c":
+            start, end = previous[-1], op[-1]
+            return {"x": round(abs(end[0] - start[0]), 2), "y": round(abs(end[1] - start[1]), 2)}
+    return None
+
+
+def describe_shapes(shapes: list[dict]) -> dict:
+    """Describe shapes with the same bounds, eg a rounded rectangle filled white and another stroked green.
+
+    The bounds are those of the path, measured from the top-left of the page as in describe_horizontal_text. A
+    stroke is centred on the path, so half of its line width lies outside the bounds and half inside. To redraw
+    it, draw a rectangle with these bounds and corners with the horizontal (x) and vertical (y) radii of
+    corner_radius_pt, filled then stroked."""
+    first = shapes[0]
+    return {
+        "x_pt": round(first["x0"], 2),
+        "top_pt": round(first["top"], 2),
+        "right_pt": round(first["x1"], 2),
+        "bottom_pt": round(first["bottom"], 2),
+        "width_pt": round(first["width"], 2),
+        "height_pt": round(first["height"], 2),
+        "corner_radius_pt": corner_radius(first),
+        "fill_colours": distinct(format_colour(s["non_stroking_color"]) for s in shapes if s["fill"]),
+        "stroke_colours": distinct(format_colour(s["stroking_color"]) for s in shapes if s["stroke"]),
+        "line_widths_pt": distinct(round(s["linewidth"], 3) for s in shapes if s["stroke"]),
+    }
+
+
+def find_bounding_box(page, x0, top, x1, bottom) -> dict | None:
+    """Describe the smallest rect or curve that contains the given area, and any upright text inside it."""
+    tolerance = SHAPE_TOLERANCE
+    shapes = containing_shapes(page, x0, top, x1, bottom)
+    if not shapes:
+        return None
+    smallest = shapes[0]
 
     def inside(item) -> bool:
         return (item["x0"] >= smallest["x0"] - tolerance and item["x1"] <= smallest["x1"] + tolerance
@@ -168,18 +219,7 @@ def find_bounding_box(page, x0, top, x1, bottom) -> dict | None:
         for word in page.extract_words(return_chars=True)
         if inside(word) and word["upright"]
     ]
-    return {
-        "x_pt": round(smallest["x0"], 2),
-        "top_pt": round(smallest["top"], 2),
-        "right_pt": round(smallest["x1"], 2),
-        "bottom_pt": round(smallest["bottom"], 2),
-        "width_pt": round(smallest["width"], 2),
-        "height_pt": round(smallest["height"], 2),
-        "fill_colours": distinct(format_colour(s["non_stroking_color"]) for s in shapes if s["fill"]),
-        "stroke_colours": distinct(format_colour(s["stroking_color"]) for s in shapes if s["stroke"]),
-        "line_widths_pt": distinct(s["linewidth"] for s in shapes if s["stroke"]),
-        "other_text": other_text,
-    }
+    return {**describe_shapes(shapes), "other_text": other_text}
 
 
 def describe_vertical_text(page, text: str) -> dict | None:
@@ -291,6 +331,254 @@ def find_candidate_count(page, box_text: str) -> dict:
         **describe_horizontal_text(page, last),
         # Text may be condensed, eg the sidebar of the base ballot, so the width isn't given by the size alone.
         "horizontal_scale": round(abs(matrix[0] / matrix[3]), 4),
+    }
+
+
+def word_size(word) -> float:
+    return round(max(c["size"] for c in word["chars"]), 2)
+
+
+def text_lines(page) -> list[dict]:
+    """Group the page's upright words into lines: runs of words in the same size on the same baseline, split where
+    the gap between words is wider than the size. Unlike pdfplumber's lines, text in different columns at about the
+    same height, eg a party name beside a recommendation's paragraph, is kept apart."""
+    lines = []
+    words = [w for w in page.extract_words(return_chars=True) if w["upright"]]
+    for word in sorted(words, key=lambda w: (round(w["chars"][0]["matrix"][5], 1), w["x0"])):
+        size, baseline = word_size(word), word["chars"][0]["matrix"][5]
+        line = next((l for l in lines
+                     if l["size"] == size and abs(l["baseline"] - baseline) <= 0.5
+                     and 0 <= word["x0"] - l["x1"] <= size), None)
+        if line is None:
+            lines.append({"text": word["text"], "chars": list(word["chars"]), "size": size, "baseline": baseline,
+                          **{k: word[k] for k in ("x0", "x1", "top", "bottom")}})
+        else:
+            line["text"] += " " + word["text"]
+            line["chars"] += word["chars"]
+            line["x1"] = word["x1"]
+            line["top"], line["bottom"] = min(line["top"], word["top"]), max(line["bottom"], word["bottom"])
+    return lines
+
+
+def text_blocks(page) -> list[list[dict]]:
+    """Group the page's upright lines of text into blocks, ie paragraphs: runs of lines in the same size, each
+    directly below the previous one and overlapping it horizontally, eg a centred paragraph wrapped over lines."""
+    blocks = []
+    for line in sorted(text_lines(page), key=lambda l: l["top"]):
+        size = line["size"]
+
+        def continues(block) -> bool:
+            prev = block[-1]
+            return (prev["size"] == size
+                    and -size / 4 <= line["top"] - prev["bottom"] <= size / 2
+                    and line["x0"] < prev["x1"] and line["x1"] > prev["x0"])
+
+        block = next((b for b in blocks if continues(b)), None)
+        if block is None:
+            blocks.append([line])
+        else:
+            block.append(line)
+    return blocks
+
+
+def block_alignment(lines: list[dict]) -> str | None:
+    """Whether the lines of a block are aligned left, centred or aligned right, or None if that can't be told."""
+    if len(lines) < 2:
+        return None
+    # Glyphs' side bearings and kerning shift each line's ends a little, so allow a fraction of the text size.
+    tolerance = max(c["size"] for line in lines for c in line["chars"]) / 5
+
+    def aligned(edge) -> bool:
+        positions = [edge(line) for line in lines]
+        return max(positions) - min(positions) <= tolerance
+
+    if aligned(lambda l: l["x0"]):
+        return "left"
+    if aligned(lambda l: (l["x0"] + l["x1"]) / 2):
+        return "centre"
+    if aligned(lambda l: l["x1"]):
+        return "right"
+    return None
+
+
+def block_bounds(lines: list[dict]) -> tuple[float, float, float, float]:
+    """The (x0, top, x1, bottom) bounds of a block of lines."""
+    return (min(line["x0"] for line in lines), lines[0]["top"],
+            max(line["x1"] for line in lines), lines[-1]["bottom"])
+
+
+def find_recommendation_count(page, search_text: str) -> dict:
+    """Describe the only block of text, eg a paragraph wrapped over several lines, that contains the given text, so
+    that the block can be replaced, eg "Number Green Light candidates first (1-3)" by searching for "Number Green
+    Light". The search ignores case, and any whitespace in it, including a line break, matches any whitespace.
+
+    Also describe, so that they can be redrawn, the border around the block (the smallest shape containing it, eg a
+    white rounded rectangle with a thick green outline) and the heading inside that border above the block (eg
+    "GREEN"), with the background behind the heading (eg a black rectangle). The heading is described like the
+    block; its background and the border are described by describe_shapes. Either may be None if there is none.
+
+        ╭───────────────────────╮ ◄─ border: bounds of its path, with corner_radius_pt and line_widths_pt
+        │  ┌─────────────────┐  │ ◄─ heading["background"]
+        │  │      GREEN      │  │ ◄─ heading
+        │  └─────────────────┘  │
+        │     Number Green      │ ◄─ the block, ie the top-level details
+        │   Light candidates    │
+        │      first (1-3)      │
+        ╰───────────────────────╯
+    """
+    wanted = " ".join(search_text.split()).casefold()
+    blocks = text_blocks(page)
+    found = [
+        block for block in blocks
+        if wanted in " ".join(" ".join(line["text"] for line in block).split()).casefold()
+    ]
+    if len(found) != 1:
+        sys.exit(f'Expected one block of text containing "{search_text}" on page {page.page_number}, '
+                 f"but found {len(found)}")
+    lines = found[0]
+    border_shapes = containing_shapes(page, *block_bounds(lines))
+    return {
+        "search_text": search_text,
+        **describe_block(page, lines),
+        "heading": find_heading(page, blocks, lines, border_shapes),
+        "border": describe_shapes(border_shapes) if border_shapes else None,
+    }
+
+
+def find_heading(page, blocks, lines, border_shapes) -> dict | None:
+    """Describe the nearest block of text above the given one inside its border, with the background behind it."""
+    if not border_shapes:
+        return None
+    border = border_shapes[0]
+    tolerance = SHAPE_TOLERANCE
+
+    def above_inside(block) -> bool:
+        x0, top, x1, bottom = block_bounds(block)
+        return (block is not lines and bottom <= lines[0]["top"] + tolerance
+                and x0 >= border["x0"] - tolerance and x1 <= border["x1"] + tolerance
+                and top >= border["top"] - tolerance)
+
+    heading = max((b for b in blocks if above_inside(b)), key=lambda b: b[-1]["bottom"], default=None)
+    if heading is None:
+        return None
+    background = containing_shapes(page, *block_bounds(heading))
+    # The border itself is not a background.
+    if background and all(abs(background[0][k] - border[k]) <= tolerance for k in ("x0", "top", "x1", "bottom")):
+        background = []
+    return {
+        **describe_block(page, heading),
+        "background": describe_shapes(background) if background else None,
+    }
+
+
+def describe_block(page, lines: list[dict]) -> dict:
+    """Describe the fonts and position of a block of lines of text, eg a paragraph.
+
+    As in describe_horizontal_text, x_pt, top_pt, right_pt and bottom_pt bound the block and are measured from the
+    top-left of the page, but each line's baseline_pt is measured up from the bottom of the page (PDF coordinates).
+    To redraw a line, draw it at its size from (x_pt, baseline_pt), or centred on centre_x_pt if the block is centred.
+    """
+    chars = [c for line in lines for c in line["chars"] if not c["text"].isspace()]
+    x0, top, x1, bottom = block_bounds(lines)
+    baselines = [next(c for c in line["chars"] if not c["text"].isspace())["matrix"][5] for line in lines]
+    matrix = chars[0]["matrix"]
+    return {
+        "page": page.page_number,
+        "text": " ".join(line["text"].strip() for line in lines),
+        "font_faces": distinct(c["fontname"] for c in chars),
+        "sizes_pt": distinct(round(c["size"], 2) for c in chars),
+        "colours": distinct(format_colour(c["non_stroking_color"]) for c in chars),
+        # Text may be condensed, so the width isn't given by the size alone.
+        "horizontal_scale": round(abs(matrix[0] / matrix[3]), 4),
+        "alignment": block_alignment(lines),
+        "x_pt": round(x0, 2),
+        "top_pt": round(top, 2),
+        "right_pt": round(x1, 2),
+        "bottom_pt": round(bottom, 2),
+        "width_pt": round(x1 - x0, 2),
+        "height_pt": round(bottom - top, 2),
+        "centre_x_pt": round((x0 + x1) / 2, 2),
+        # Distance between consecutive baselines.
+        "line_spacing_pt": round((baselines[0] - baselines[-1]) / (len(lines) - 1), 2) if len(lines) > 1 else None,
+        "lines": [
+            {
+                "text": line["text"].strip(),
+                "x_pt": round(line["x0"], 2),
+                "width_pt": round(line["x1"] - line["x0"], 2),
+                "baseline_pt": round(baseline, 2),
+            }
+            for line, baseline in zip(lines, baselines)
+        ],
+        "page_size_pt": {"width": page.width, "height": page.height},
+    }
+
+
+def char_style(char) -> dict:
+    """The font, size, colour and horizontal scale of a character."""
+    matrix = char["matrix"]
+    return {
+        "font_face": char["fontname"],
+        "size_pt": round(char["size"], 2),
+        "colour": format_colour(char["non_stroking_color"]),
+        # Text may be condensed, so the width isn't given by the size alone.
+        "horizontal_scale": round(abs(matrix[0] / matrix[3]), 4),
+    }
+
+
+def find_replaceable_electorate_name(page, name: str) -> dict:
+    """Describe the electorate's name, eg "Kew", in the only block of text containing it as whole words, eg the
+    sentence "Kew is a Red Light electorate!", so that the name can be replaced by another electorate's and the rest
+    of the sentence moved to suit. The search is case-sensitive, so that eg "KEW DISTRICT" isn't matched, and any
+    whitespace in the name, including a line break, matches any whitespace.
+
+    The block is described as by describe_block, with its text split into runs: consecutive characters in the same
+    style (font, size, colour and horizontal scale), with the name in a run of its own marked "replaceable". Each
+    space between words is styled like the character before it."""
+    wanted = " ".join(name.split())
+    pattern = re.compile(rf"(?<!\w){re.escape(wanted)}(?!\w)")
+    found = []
+    for lines in text_blocks(page):
+        block_text = " ".join(line["text"].strip() for line in lines)
+        found += [(lines, block_text, match) for match in pattern.finditer(block_text)]
+    if len(found) != 1:
+        sys.exit(f'Expected "{wanted}" once, as whole words, in the text on page {page.page_number}, '
+                 f"but found it {len(found)} times")
+    lines, block_text, match = found[0]
+
+    # The style of each character of the block's text, taking the characters drawn in turn.
+    chars = iter(c for line in lines for c in line["chars"] if not c["text"].isspace())
+    styles, remaining, style = [], 0, None
+    name_chars = []
+    for i, letter in enumerate(block_text):
+        if letter.isspace():
+            styles.append(style)
+            continue
+        if remaining == 0:  # a character may draw several letters, eg a ligature
+            char = next(chars)
+            style, remaining = char_style(char), len(char["text"])
+            if match.start() <= i < match.end():
+                name_chars.append(char)
+        styles.append(style)
+        remaining -= 1
+
+    runs = []
+    for i, (letter, style) in enumerate(zip(block_text, styles)):
+        replaceable = match.start() <= i < match.end()
+        if runs and runs[-1]["replaceable"] == replaceable and runs[-1]["style"] == style:
+            runs[-1]["text"] += letter
+        else:
+            runs.append({"text": letter, "replaceable": replaceable, "style": style})
+    matrix = name_chars[0]["matrix"]
+    return {
+        "replaceable_text": wanted,
+        "font_faces": distinct(c["fontname"] for c in name_chars),
+        "sizes_pt": distinct(round(c["size"], 2) for c in name_chars),
+        "colours": distinct(format_colour(c["non_stroking_color"]) for c in name_chars),
+        "horizontal_scale": round(abs(matrix[0] / matrix[3]), 4),
+        "block": {
+            **describe_block(page, lines),
+            "runs": [{"text": run["text"], "replaceable": run["replaceable"], **run["style"]} for run in runs],
+        },
     }
 
 
@@ -440,8 +728,20 @@ def main() -> None:
     parser.add_argument("--vertical-text", metavar="TEXT", nargs="+", action="extend",
                         help="any text rotated a quarter turn on the same page to describe, with the box around it, "
                              "eg 'DEMOCRATIC LABOUR PARTY'")
+    parser.add_argument("--recommendation", metavar=("RECOMMENDATION", "TEXT"), nargs=2, action="append",
+                        help="a recommendation and any text in the block of text on the same page stating how many "
+                             "candidates have it, to describe so that the block can be replaced; may be repeated, "
+                             "eg --recommendation G 'Number Green Light candidates'")
+    parser.add_argument("--electorate-name", metavar="TEXT",
+                        help="the electorate's name as written (case-sensitive) in a block of text on the same page, "
+                             "to be replaced by each electorate's name when rendering, eg 'Kew' in "
+                             "'Kew is a Red Light electorate!'")
     args = parser.parse_args()
 
+    recommendations = [recommendation for recommendation, _ in args.recommendation or []]
+    duplicates = sorted({r for r in recommendations if recommendations.count(r) > 1})
+    if duplicates:
+        parser.error(f"--recommendation given more than once for {', '.join(duplicates)}")
     if not args.pdf.is_file():
         sys.exit(f"No such file: {args.pdf}")
 
@@ -464,6 +764,14 @@ def main() -> None:
                         if description is None:
                             sys.exit(f'Vertical text "{text}" not found on page {page.page_number} of {args.pdf}')
                         details["vertical_text"].append(description)
+                if args.recommendation:
+                    details["recommendations"] = {
+                        recommendation: find_recommendation_count(page, text)
+                        for recommendation, text in args.recommendation
+                    }
+                if args.electorate_name:
+                    details["replaceable_electorate_name"] = find_replaceable_electorate_name(
+                        page, args.electorate_name)
                 matches.append(details)
 
     if not matches:
